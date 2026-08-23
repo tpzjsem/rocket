@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#05070f">
+<title>로켓</title>
+<style>
+  /* ============================================================
+     STYLE — 계기판 컨셉. 색은 전부 의미를 가집니다.
+       초록 = 궤도 성공   빨강 = 추락 경로
+       주황 = 엔진/연료   시안 = 진행방향(프로그레이드)
+     ============================================================ */
+  :root{
+    --bg:#05070f;
+    --ink:#e8eef7;
+    --dim:#7b8aa3;
+    --good:#3ce089;
+    --bad:#ff4d5e;
+    --fire:#ffa432;
+    --pro:#42d7ff;
+    --panel:rgba(10,16,30,.72);
+    --edge:rgba(120,150,200,.28);
+    --num: ui-monospace, "SF Mono", "Roboto Mono", Menlo, Consolas, monospace;
+    --ui: system-ui, -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{
+    margin:0; height:100%; overflow:hidden;
+    background:var(--bg); color:var(--ink);
+    font-family:var(--ui);
+    overscroll-behavior:none;
+    user-select:none; -webkit-user-select:none;
+  }
+  canvas{ display:block; width:100%; height:100%; touch-action:none; }
+
+  .layer{
+    position:fixed; inset:0; pointer-events:none;
+    padding: max(10px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right))
+             max(10px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
+  }
+
+  /* ---------- 텔레메트리 ---------- */
+  #tele{
+    position:absolute; top:0; left:0;
+    background:var(--panel); border:1px solid var(--edge); border-radius:12px;
+    padding:9px 12px; backdrop-filter:blur(8px);
+    display:grid; grid-template-columns:auto auto; gap:2px 14px;
+    font-size:12px; line-height:1.5;
+  }
+  #tele dt{ color:var(--dim); letter-spacing:.02em; }
+  #tele dd{ margin:0; font-family:var(--num); text-align:right; font-variant-numeric:tabular-nums; }
+  #tele dd.good{ color:var(--good); }
+  #tele dd.bad{ color:var(--bad); }
+  #tele dd.fire{ color:var(--fire); }
+
+  /* ---------- 우상단 유틸 ---------- */
+  #util{ position:absolute; top:0; right:0; display:flex; gap:6px; pointer-events:auto; }
+  .chip{
+    background:var(--panel); border:1px solid var(--edge); border-radius:10px;
+    color:var(--ink); font:600 12px/1 var(--ui); padding:9px 11px; min-width:40px;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .chip.on{ border-color:var(--pro); color:var(--pro); }
+
+  /* ---------- 스로틀 ---------- */
+  #throttle{
+    position:absolute; left:0; bottom:0; width:74px; height:min(56vh,260px);
+    background:var(--panel); border:1px solid var(--edge); border-radius:16px;
+    overflow:hidden; pointer-events:auto; touch-action:none;
+  }
+  #fill{ position:absolute; left:0; right:0; bottom:0; height:0%;
+    background:linear-gradient(180deg,var(--fire),rgba(255,164,50,.25)); }
+  #tlabel{ position:absolute; inset:auto 0 8px 0; text-align:center;
+    font:700 15px/1 var(--num); text-shadow:0 1px 3px #000; }
+  #tcap{ position:absolute; inset:8px 0 auto 0; text-align:center;
+    font:600 10px/1 var(--ui); color:var(--dim); letter-spacing:.1em; }
+
+  /* ---------- 조종 ---------- */
+  #stick{ position:absolute; right:0; bottom:0; display:grid; gap:8px;
+    grid-template-columns:repeat(2,72px); pointer-events:auto; }
+  .key{
+    height:72px; border-radius:18px; background:var(--panel);
+    border:1px solid var(--edge); color:var(--ink);
+    display:flex; align-items:center; justify-content:center;
+    font:700 22px/1 var(--ui); touch-action:none;
+  }
+  .key.small{ height:46px; font-size:11px; letter-spacing:.06em; }
+  .key:active,.key.held{ background:rgba(66,215,255,.2); border-color:var(--pro); color:var(--pro); }
+
+  /* ---------- 상태 배너 ---------- */
+  #banner{
+    position:absolute; left:50%; top:34%; transform:translate(-50%,-50%);
+    text-align:center; opacity:0; transition:opacity .25s;
+  }
+  #banner b{ display:block; font-size:30px; letter-spacing:-.02em; }
+  #banner span{ font-size:13px; color:var(--dim); }
+  #banner.show{ opacity:1; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div class="layer">
+  <dl id="tele">
+    <dt>고도</dt><dd id="t-alt">0</dd>
+    <dt>속도</dt><dd id="t-vel">0</dd>
+    <dt>최고점</dt><dd id="t-apo">-</dd>
+    <dt>최저점</dt><dd id="t-per">-</dd>
+    <dt>연료</dt><dd id="t-fuel" class="fire">100%</dd>
+  </dl>
+
+  <div id="util">
+    <button class="chip" id="b-warp">×1</button>
+    <button class="chip" id="b-map">지도</button>
+    <button class="chip" id="b-reset">처음</button>
+  </div>
+
+  <div id="throttle">
+    <div id="fill"></div>
+    <div id="tcap">엔진</div>
+    <div id="tlabel">0%</div>
+  </div>
+
+  <div id="stick">
+    <button class="key small" id="b-pro">앞으로</button>
+    <button class="key small" id="b-retro">뒤로</button>
+    <button class="key" id="b-left">◀</button>
+    <button class="key" id="b-right">▶</button>
+  </div>
+
+  <div id="banner"><b></b><span></span></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* ==================================================================
+   설정 — 게임 느낌은 전부 여기서 조절합니다. 아이한테 만지게 하세요.
+   ================================================================== */
+const CFG = {
+  R:          300,     // 행성 반지름
+  MU:         288000,  // 중력 세기 (μ = GM). 지표 중력 = MU/R² = 3.2
+  MAX_THRUST: 6.0,     // 최대 추력 (질량 1 기준) → 이륙 추중비 1.87
+  TURN_RATE:  1.5,     // 손으로 도는 속도 (rad/s)
+  ALIGN_RATE: 3.0,     // 자동정렬 도는 속도
+  FUEL:       40,      // 최대 추력 기준 연료 지속 시간(초)
+  BOTTOM:     2.5,     // 로켓 중심에서 엔진 끝까지
+  LAND_SPEED: 6,       // 이 속도 아래로 닿으면 착륙 성공
+  UPRIGHT:    0.85,    // 착륙 시 요구되는 '똑바로' 정도
+  DT:         1/60,    // 물리 고정 스텝 — 기기 주사율과 무관하게 항상 이 값
+  PRED_N:     260,     // 예측선 점 개수
+  PRED_MAX:   40,      // 예측선을 그리는 최대 반경 (행성 반지름의 배수)
+  CAM_TILT:   0.25,    // 2.5D 기울기(rad). 0이면 완전 정면
+};
+
+/* ==================================================================
+   PHYSICS — 이 블록은 THREE를 절대 참조하지 않습니다.
+   렌더러를 통째로 갈아끼워도 여기는 그대로 삽니다.
+   ================================================================== */
+function newState(){
+  return {
+    pos:{ x:0, y:CFG.R + CFG.BOTTOM },
+    vel:{ x:0, y:0 },
+    angle: Math.PI/2,      // +X축 기준. π/2 = 하늘 방향
+    fuel: CFG.FUEL,
+    landed: true, crashed: false, status: null, t: 0,
+  };
+}
+
+function wrapAngle(a){ return Math.atan2(Math.sin(a), Math.cos(a)); }
+
+function step(s, dt, inp){
+  if (s.crashed) return;
+  s.t += dt;
+
+  // --- 1. 회전 ---
+  let turn = inp.turnDir * CFG.TURN_RATE;
+  if (inp.align){
+    const sp = Math.hypot(s.vel.x, s.vel.y);
+    let target;
+    if (sp < 1)                      target = Math.atan2(s.pos.y, s.pos.x);   // 멈춰있으면 '위'
+    else if (inp.align === 'pro')    target = Math.atan2(s.vel.y, s.vel.x);
+    else                             target = Math.atan2(-s.vel.y, -s.vel.x);
+    const d = wrapAngle(target - s.angle);
+    turn = Math.max(-CFG.ALIGN_RATE, Math.min(CFG.ALIGN_RATE, d/dt));
+  }
+  s.angle = wrapAngle(s.angle + turn*dt);
+
+  // --- 2. 가속도 = 중력 + 추력 ---
+  const r2 = s.pos.x*s.pos.x + s.pos.y*s.pos.y;
+  const r  = Math.sqrt(r2);
+  const g  = -CFG.MU / (r2*r);              // a_grav = g * pos
+  let ax = s.pos.x*g, ay = s.pos.y*g;
+
+  let burning = false;
+  if (s.fuel > 0 && inp.throttle > 0.01){
+    const T = CFG.MAX_THRUST * inp.throttle;
+    ax += Math.cos(s.angle)*T;
+    ay += Math.sin(s.angle)*T;
+    s.fuel = Math.max(0, s.fuel - inp.throttle*dt);
+    burning = true;
+    s.landed = false;                        // 엔진 켜면 발사대에서 떨어짐
+  }
+  s.burning = burning;
+
+  // --- 3. 심플렉틱(반암시) 오일러 : 속도 먼저, 그 속도로 위치 ---
+  //     순서를 뒤집으면 궤도가 서서히 무너집니다. 이 두 줄이 전부입니다.
+  s.vel.x += ax*dt;  s.vel.y += ay*dt;
+  s.pos.x += s.vel.x*dt;  s.pos.y += s.vel.y*dt;
+
+  // --- 4. 지면 ---
+  const nr = Math.hypot(s.pos.x, s.pos.y);
+  const ground = CFG.R + CFG.BOTTOM;
+  if (nr < ground){
+    const nx = s.pos.x/nr, ny = s.pos.y/nr;
+    s.pos.x = nx*ground;  s.pos.y = ny*ground;
+    const speed   = Math.hypot(s.vel.x, s.vel.y);
+    const upright = Math.cos(s.angle)*nx + Math.sin(s.angle)*ny;
+    s.vel.x = 0; s.vel.y = 0;
+    if (!s.landed){
+      if (speed < CFG.LAND_SPEED && upright > CFG.UPRIGHT){
+        s.landed = true;  s.status = ['착륙 성공','엔진을 켜면 다시 떠오릅니다'];
+      } else {
+        s.crashed = true; s.status = ['쿵! 부서졌어요','더 천천히, 더 똑바로 내려앉아 보세요'];
+      }
+    }
+  }
+}
+
+/* ---- 궤도 요소: 지금 상태에서 미래 경로를 수학으로 바로 뽑습니다 ----
+   수치적분으로 미리 돌리는 것보다 훨씬 싸고, 오차가 아예 없고,
+   최고점/최저점이 공짜로 나옵니다.                                   */
+function orbitOf(pos, vel, mu){
+  const r   = Math.hypot(pos.x, pos.y);
+  const v2  = vel.x*vel.x + vel.y*vel.y;
+  const h   = pos.x*vel.y - pos.y*vel.x;          // 각운동량(2D면 스칼라)
+  const rdv = pos.x*vel.x + pos.y*vel.y;
+  const k   = v2 - mu/r;
+  const ex  = (k*pos.x - rdv*vel.x)/mu;           // 이심률 벡터
+  const ey  = (k*pos.y - rdv*vel.y)/mu;
+  const e   = Math.hypot(ex, ey);
+  const p   = h*h/mu;                             // 통경
+  const omega = Math.atan2(ey, ex);               // 근점 방향
+  const nu    = wrapAngle(Math.atan2(pos.y, pos.x) - omega);
+  return { r, e, p, h, omega, nu,
+           peri: p/(1+e),
+           apo:  e < 1 ? p/(1-e) : Infinity };
+}
+
+function predictPath(el, out){
+  const dir  = el.h >= 0 ? 1 : -1;
+  const lim  = CFG.R * CFG.PRED_MAX;
+  let n = 0, hitGround = false;
+  for (let i = 0; i <= CFG.PRED_N; i++){
+    const nu = el.nu + dir * (Math.PI*2) * (i/CFG.PRED_N);
+    const den = 1 + el.e*Math.cos(nu);
+    if (den < 0.02) break;                        // 쌍곡선 점근선
+    const r = el.p/den;
+    if (r > lim) break;
+    if (r < CFG.R){ hitGround = true; break; }    // 여기서 부딪힙니다
+    const a = nu + el.omega;
+    out[n*3+0] = r*Math.cos(a);
+    out[n*3+1] = r*Math.sin(a);
+    out[n*3+2] = 0;
+    n++;
+  }
+  return { count:n, hitGround };
+}
+
+/* ==================================================================
+   RENDER — 여기부터가 THREE 영역. 물리는 이 아래를 전혀 모릅니다.
+   ================================================================== */
+const canvas = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, logarithmicDepthBuffer:true });
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.setClearColor(0x05070f, 1);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(52, 1, 1, 500000);
+
+scene.add(new THREE.AmbientLight(0x33507a, 0.55));
+const sun = new THREE.DirectionalLight(0xfff2dd, 1.5);
+sun.position.set(1, 0.55, 0.75).normalize();
+scene.add(sun);
+
+// --- 별 ---
+{
+  const N = 900, arr = new Float32Array(N*3);
+  for (let i=0;i<N;i++){
+    const u = Math.random()*2-1, th = Math.random()*Math.PI*2, s = Math.sqrt(1-u*u), d = 90000;
+    arr[i*3]=Math.cos(th)*s*d; arr[i*3+1]=Math.sin(th)*s*d; arr[i*3+2]=u*d;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(arr,3));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color:0x9fb8d8, size:1.6, sizeAttenuation:false })));
+}
+
+// --- 행성 + 대기 + 지형 ---
+const planet = new THREE.Mesh(
+  new THREE.SphereGeometry(CFG.R, 72, 52),
+  new THREE.MeshStandardMaterial({ color:0x2f6f52, roughness:0.95, metalness:0 })
+);
+scene.add(planet);
+scene.add(new THREE.Mesh(
+  new THREE.SphereGeometry(CFG.R*1.045, 48, 32),
+  new THREE.MeshBasicMaterial({ color:0x63b5ff, transparent:true, opacity:0.14, side:THREE.BackSide })
+));
+// 적도(=궤도면) 위 산들. 고도감을 주는 유일한 단서라 꼭 필요합니다.
+for (let i=0;i<40;i++){
+  const a = (i/40)*Math.PI*2 + Math.random()*0.05;
+  const h = 4 + Math.random()*11;
+  const m = new THREE.Mesh(new THREE.ConeGeometry(3+Math.random()*4, h, 6),
+            new THREE.MeshStandardMaterial({ color:0x24523d, roughness:1 }));
+  m.position.set(Math.cos(a)*(CFG.R+h/2-1), Math.sin(a)*(CFG.R+h/2-1), 0);
+  m.rotation.z = a - Math.PI/2;
+  scene.add(m);
+}
+// 발사대
+{
+  const pad = new THREE.Mesh(new THREE.BoxGeometry(16,3,16),
+             new THREE.MeshStandardMaterial({ color:0x8b95a6, roughness:.7 }));
+  pad.position.set(0, CFG.R, 0);
+  scene.add(pad);
+}
+
+// --- 로켓 ---
+const rocket = new THREE.Group();
+{
+  const white = new THREE.MeshStandardMaterial({ color:0xeef3fb, roughness:.45, metalness:.15 });
+  const red   = new THREE.MeshStandardMaterial({ color:0xff4d5e, roughness:.5 });
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.9,0.9,5,18), white);
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(0.9,2,18), red); nose.position.y = 3.5;
+  rocket.add(body, nose);
+  for (const sx of [-1,1]){
+    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.25,1.8,1.6), red);
+    fin.position.set(sx*0.9, -1.9, 0);
+    rocket.add(fin);
+  }
+}
+const flame = new THREE.Mesh(
+  new THREE.ConeGeometry(0.75, 3.4, 14),
+  new THREE.MeshBasicMaterial({ color:0xffa432, transparent:true, opacity:.92 })
+);
+flame.rotation.z = Math.PI; flame.position.y = -4.2; flame.visible = false;
+rocket.add(flame);
+scene.add(rocket);
+
+// --- 예측 궤도선 + 최고/최저점 마커 ---
+const predBuf = new Float32Array((CFG.PRED_N+1)*3);
+const predGeo = new THREE.BufferGeometry();
+predGeo.setAttribute('position', new THREE.BufferAttribute(predBuf,3));
+const predLine = new THREE.Line(predGeo, new THREE.LineBasicMaterial({ color:0x3ce089, transparent:true, opacity:.85 }));
+predLine.frustumCulled = false;
+scene.add(predLine);
+
+const markBuf = new Float32Array(6);
+const markGeo = new THREE.BufferGeometry();
+markGeo.setAttribute('position', new THREE.BufferAttribute(markBuf,3));
+const marks = new THREE.Points(markGeo, new THREE.PointsMaterial({ color:0xffffff, size:7, sizeAttenuation:false }));
+marks.frustumCulled = false;
+scene.add(marks);
+
+function resize(){
+  const w = innerWidth, h = innerHeight;
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));  // 3배는 폰에서 프레임만 잡아먹습니다
+  renderer.setSize(w, h, false);
+  camera.aspect = w/h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+/* ==================================================================
+   INPUT
+   ================================================================== */
+const inp = { throttle:0, turnDir:0, align:null };
+let mapView = false, warp = 1;
+const WARPS = [1,5,20,100];
+
+const $ = id => document.getElementById(id);
+
+function hold(el, on, off){
+  const down = e => { e.preventDefault(); el.classList.add('held'); on(); };
+  const up   = e => { e.preventDefault(); el.classList.remove('held'); off(); };
+  el.addEventListener('pointerdown', down);
+  el.addEventListener('pointerup', up);
+  el.addEventListener('pointercancel', up);
+  el.addEventListener('pointerleave', up);
+}
+hold($('b-left'),  ()=>inp.turnDir= 1, ()=>inp.turnDir=0);   // 반시계
+hold($('b-right'), ()=>inp.turnDir=-1, ()=>inp.turnDir=0);
+hold($('b-pro'),   ()=>inp.align='pro',   ()=>inp.align=null);
+hold($('b-retro'), ()=>inp.align='retro', ()=>inp.align=null);
+
+// 스로틀: 세로 드래그
+{
+  const el = $('throttle');
+  let dragging = false;
+  const set = e => {
+    const r = el.getBoundingClientRect();
+    inp.throttle = Math.max(0, Math.min(1, (r.bottom - e.clientY)/r.height));
+    if (inp.throttle > 0.01 && warp !== 1) setWarp(0);
+  };
+  el.addEventListener('pointerdown', e=>{ e.preventDefault(); dragging=true; el.setPointerCapture(e.pointerId); set(e); });
+  el.addEventListener('pointermove', e=>{ if(dragging){ e.preventDefault(); set(e); } });
+  const end = ()=> dragging=false;
+  el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+}
+
+function setWarp(i){ warp = WARPS[i]; $('b-warp').textContent = '×'+warp; }
+$('b-warp').onclick = ()=> setWarp((WARPS.indexOf(warp)+1) % WARPS.length);
+$('b-map').onclick  = ()=>{ mapView = !mapView; $('b-map').classList.toggle('on', mapView); };
+$('b-reset').onclick = reset;
+
+addEventListener('keydown', e=>{
+  if (e.key==='ArrowLeft'||e.key==='a') inp.turnDir= 1;
+  if (e.key==='ArrowRight'||e.key==='d') inp.turnDir=-1;
+  if (e.key==='w') inp.throttle = Math.min(1, inp.throttle+0.1);
+  if (e.key==='s') inp.throttle = Math.max(0, inp.throttle-0.1);
+  if (e.key==='Shift') inp.throttle = 1;
+  if (e.key==='x') inp.throttle = 0;
+  if (e.key==='q') inp.align='pro';
+  if (e.key==='e') inp.align='retro';
+  if (e.key==='m') $('b-map').click();
+  if (e.key==='r') reset();
+  if (e.key===',') setWarp((WARPS.indexOf(warp)+1)%WARPS.length);
+});
+addEventListener('keyup', e=>{
+  if (['ArrowLeft','ArrowRight','a','d'].includes(e.key)) inp.turnDir=0;
+  if (e.key==='q'||e.key==='e') inp.align=null;
+});
+
+// 긴 분사 중에 화면 꺼지는 것 방지
+(async()=>{ try{ if('wakeLock' in navigator) await navigator.wakeLock.request('screen'); }catch(_){} })();
+
+/* ==================================================================
+   LOOP — 물리는 항상 고정 dt. 렌더링만 화면 주사율을 따라갑니다.
+   이걸 안 하면 60Hz 폰과 120Hz 폰에서 궤도가 달라집니다.
+   ================================================================== */
+let state = newState();
+function reset(){
+  state = newState(); inp.throttle = 0; setWarp(0);
+  mapView = false; $('b-map').classList.remove('on');
+  $('banner').classList.remove('show');
+}
+
+let acc = 0, last = performance.now(), camDist = 90;
+
+function frame(now){
+  requestAnimationFrame(frame);
+  let dt = (now - last)/1000; last = now;
+  if (dt > 0.25) dt = 0.25;
+
+  acc += dt * warp;
+  let n = 0;
+  while (acc >= CFG.DT && n < 300){ step(state, CFG.DT, inp); acc -= CFG.DT; n++; }
+  if (n >= 300) acc = 0;
+
+  draw();
+}
+
+function draw(){
+  const s = state;
+
+  // 로켓
+  rocket.position.set(s.pos.x, s.pos.y, 0);
+  rocket.rotation.z = s.angle - Math.PI/2;   // 모델의 +Y가 추력 방향
+  const th = (s.fuel > 0 && !s.crashed) ? inp.throttle : 0;
+  flame.visible = th > 0.02;
+  flame.scale.set(0.7+th*0.5, th*(0.85+Math.random()*0.3), 0.7+th*0.5);
+  rocket.visible = !s.crashed;
+
+  // 궤도
+  const el = orbitOf(s.pos, s.vel, CFG.MU);
+  const { count, hitGround } = predictPath(el, predBuf);
+  predGeo.attributes.position.needsUpdate = true;
+  predGeo.setDrawRange(0, count);
+  const danger = hitGround || el.peri < CFG.R;
+  predLine.material.color.setHex(danger ? 0xff4d5e : 0x3ce089);
+  predLine.visible = !s.landed && !s.crashed && count > 2;
+
+  // 최고/최저점 마커
+  if (predLine.visible && el.e < 1){
+    const wa = el.omega;
+    markBuf[0]=Math.cos(wa)*el.peri;      markBuf[1]=Math.sin(wa)*el.peri;      markBuf[2]=0;
+    markBuf[3]=-Math.cos(wa)*el.apo;      markBuf[4]=-Math.sin(wa)*el.apo;      markBuf[5]=0;
+    markGeo.attributes.position.needsUpdate = true;
+    marks.visible = true;
+  } else marks.visible = false;
+
+  // 카메라
+  let target, want;
+  if (mapView){
+    target = new THREE.Vector3(0,0,0);
+    const far = (el.e < 1 && isFinite(el.apo)) ? el.apo : Math.max(el.r, CFG.R*3);
+    want = Math.min(far*1.5 + CFG.R, CFG.R*CFG.PRED_MAX);
+  } else {
+    target = new THREE.Vector3(s.pos.x, s.pos.y, 0);
+    const alt = Math.max(0, el.r - CFG.R);
+    want = 60 + alt*0.9;                              // 고도에 따라 자동 줌아웃
+  }
+  camDist += (want - camDist) * 0.08;                 // 부드럽게 따라감
+  const t = CFG.CAM_TILT;
+  camera.position.set(target.x, target.y - Math.sin(t)*camDist, Math.cos(t)*camDist);
+  camera.lookAt(target);
+
+  hud(s, el, danger);
+  renderer.render(scene, camera);
+}
+
+/* ---------------- HUD ---------------- */
+const fmt = v => !isFinite(v) ? '∞' : Math.round(v).toLocaleString('ko');
+function hud(s, el, danger){
+  $('t-alt').textContent = fmt(el.r - CFG.R);
+  $('t-vel').textContent = fmt(Math.hypot(s.vel.x, s.vel.y));
+  $('t-apo').textContent = el.e < 1 ? fmt(el.apo - CFG.R) : '탈출';
+  const per = $('t-per');
+  per.textContent = fmt(el.peri - CFG.R);
+  per.className = danger ? 'bad' : 'good';
+  $('t-apo').className = danger ? '' : 'good';
+
+  const f = Math.round(s.fuel/CFG.FUEL*100);
+  $('t-fuel').textContent = f + '%';
+  $('t-fuel').className = f > 15 ? 'fire' : 'bad';
+
+  const p = Math.round((s.fuel > 0 ? inp.throttle : 0)*100);
+  $('fill').style.height = p + '%';
+  $('tlabel').textContent = p + '%';
+
+  const b = $('banner');
+  if (s.status){ b.querySelector('b').textContent = s.status[0];
+                 b.querySelector('span').textContent = s.status[1];
+                 b.classList.add('show'); s.status = null;
+                 setTimeout(()=>b.classList.remove('show'), 3200); }
+}
+
+setWarp(0);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
