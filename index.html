@@ -96,6 +96,16 @@
   #banner b{ display:block; font-size:30px; letter-spacing:-.02em; }
   #banner span{ font-size:13px; color:var(--dim); }
   #banner.show{ opacity:1; }
+
+  /* ---------- 브레이크 경고 : 지금 안 늦추면 못 멈추고 부딪힐 때 ---------- */
+  #brakeWarn{
+    position:absolute; left:50%; bottom:16%; transform:translateX(-50%) scale(1);
+    background:var(--bad); color:#fff; font:800 15px/1 var(--ui);
+    padding:9px 16px; border-radius:999px; opacity:0; pointer-events:none;
+    transition:opacity .15s;
+  }
+  #brakeWarn.show{ opacity:1; animation:brakePulse .5s ease-in-out infinite alternate; }
+  @keyframes brakePulse{ from{ transform:translateX(-50%) scale(1); } to{ transform:translateX(-50%) scale(1.08); } }
 </style>
 </head>
 <body>
@@ -131,6 +141,7 @@
   </div>
 
   <div id="banner"><b></b><span></span></div>
+  <div id="brakeWarn">🔥 지금 '뒤로'! 속도를 줄이세요</div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -154,6 +165,7 @@ const CFG = {
   CAM_TILT:   0.25,    // 2.5D 기울기(rad). 0이면 완전 정면
   ZOOM_MIN:   0.4,     // 핀치/휠 줌으로 들어갈 수 있는 최대 배율(1보다 작을수록 확대)
   ZOOM_MAX:   3.5,     // 핀치/휠 줌으로 나갈 수 있는 최대 배율
+  BRAKE_WARN: 0.3,     // 지금 필요한 브레이크 세기가 최대 추력의 이 비율을 넘으면 경고. 낮출수록 더 일찍(여유있게) 뜸
 
   // ---- 달 ----
   MOON_R:     90,       // 달 반지름 (행성보다 작게)
@@ -172,6 +184,7 @@ function newState(){
     angle: Math.PI/2,      // +X축 기준. π/2 = 하늘 방향
     fuel: CFG.FUEL,
     landed: true, landedOn: 'planet', crashed: false, status: null, t: 0,
+    tipMoon: false,   // 달 중력권에 처음 들어왔을 때 안내를 한 번만 보여주기 위한 표시
   };
 }
 
@@ -200,6 +213,12 @@ function dominantBody(pos){
 function step(s, dt, inp){
   if (s.crashed) return;
   s.t += dt;
+
+  // --- 0. 달에 처음 들어왔을 때 한 번만 안내 ---
+  if (!s.tipMoon && !s.landed && dominantBody(s.pos).name === 'moon'){
+    s.tipMoon = true;
+    s.status = ['달 중력권!', "'뒤로'를 누르고 있으면 속도가 줄어요"];
+  }
 
   // --- 1. 회전 ---
   let turn = inp.turnDir * CFG.TURN_RATE;
@@ -320,6 +339,22 @@ function predictPath(el, out, ref){
     n++;
   }
   return { count:n, hitGround };
+}
+
+/* ---- 똑바로 위/아래로만 날 때(각운동량≈0)를 위한 예측선 ----
+   이럴 땐 궤도가 곡선이 아니라 표면~최고점을 잇는 곧은 막대기입니다.
+   "여기까지 올라갔다가 이 지점에 떨어져요"를 그대로 보여줍니다. */
+function predictRadialLine(relPos, ref, apo, out){
+  const theta = Math.atan2(relPos.y, relPos.x);
+  const rTop  = isFinite(apo) ? Math.min(apo, CFG.R*CFG.PRED_MAX) : CFG.R*CFG.PRED_MAX;
+  const rBot  = ref.R;
+  for (let i = 0; i <= CFG.PRED_N; i++){
+    const r = rBot + (rTop - rBot) * (i/CFG.PRED_N);
+    out[i*3+0] = ref.x + r*Math.cos(theta);
+    out[i*3+1] = ref.y + r*Math.sin(theta);
+    out[i*3+2] = 0;
+  }
+  return { count: CFG.PRED_N+1, hitGround: isFinite(apo) };
 }
 
 /* ==================================================================
@@ -583,15 +618,31 @@ function draw(){
   const ref = dominantBody(s.pos);
   const relPos = { x: s.pos.x - ref.x, y: s.pos.y - ref.y };
   const el = orbitOf(relPos, s.vel, ref.MU);
-  const { count, hitGround } = predictPath(el, predBuf, ref);
+
+  // 똑바로 위/아래로만 날 때(h=0)는 곧은 막대 예측선, 그 외엔 원래 궤도 곡선
+  let count, hitGround, danger;
+  if (el.h === 0){
+    ({ count, hitGround } = predictRadialLine(relPos, ref, el.apo, predBuf));
+    danger = hitGround;   // 다시 떨어진다면(최고점이 유한) 위험, 탈출 중이면 안전
+  } else {
+    ({ count, hitGround } = predictPath(el, predBuf, ref));
+    danger = hitGround || el.peri < ref.R;
+  }
   predGeo.attributes.position.needsUpdate = true;
   predGeo.setDrawRange(0, count);
-  const danger = hitGround || el.peri < ref.R;
   predLine.material.color.setHex(danger ? 0xff4d5e : 0x3ce089);
   predLine.visible = !s.landed && !s.crashed && count > 2;
 
-  // 최고/최저점 마커 (기준 천체 중심 기준)
-  if (predLine.visible && el.e < 1){
+  // 최고점 / 착륙(최저)점 마커 (기준 천체 중심 기준)
+  if (predLine.visible && el.h === 0){
+    // 곧은 막대일 땐 '떨어질 지점'과 '제일 높이 가는 지점'을 찍어줍니다
+    const theta = Math.atan2(relPos.y, relPos.x);
+    markBuf[0]=ref.x+Math.cos(theta)*ref.R;              markBuf[1]=ref.y+Math.sin(theta)*ref.R;              markBuf[2]=0;
+    const rTop = isFinite(el.apo) ? el.apo : ref.R;
+    markBuf[3]=ref.x+Math.cos(theta)*rTop;               markBuf[4]=ref.y+Math.sin(theta)*rTop;               markBuf[5]=0;
+    markGeo.attributes.position.needsUpdate = true;
+    marks.visible = true;
+  } else if (predLine.visible && el.e < 1){
     const wa = el.omega;
     markBuf[0]=ref.x+Math.cos(wa)*el.peri;      markBuf[1]=ref.y+Math.sin(wa)*el.peri;      markBuf[2]=0;
     markBuf[3]=ref.x-Math.cos(wa)*el.apo;      markBuf[4]=ref.y-Math.sin(wa)*el.apo;      markBuf[5]=0;
@@ -626,13 +677,24 @@ function draw(){
 const fmt = v => !isFinite(v) ? '∞' : Math.round(v).toLocaleString('ko');
 function hud(s, el, danger, ref){
   $('t-ref').textContent = ref.name === 'moon' ? '달' : '행성';
-  $('t-alt').textContent = fmt(el.r - ref.R);
-  $('t-vel').textContent = fmt(Math.hypot(s.vel.x, s.vel.y));
-  $('t-apo').textContent = el.e < 1 ? fmt(el.apo - ref.R) : '탈출';
+  const alt = el.r - ref.R;
+  const speed = Math.hypot(s.vel.x, s.vel.y);
+  $('t-alt').textContent = fmt(alt);
+  $('t-vel').textContent = fmt(speed);
+  $('t-apo').textContent = isFinite(el.apo) ? fmt(el.apo - ref.R) : '탈출';
   const per = $('t-per');
   per.textContent = fmt(el.peri - ref.R);
   per.className = danger ? 'bad' : 'good';
   $('t-apo').className = danger ? '' : 'good';
+
+  // 지금 최대로 브레이크를 걸어도 표면에 닿기 전에 못 멈추면 경고를 띄웁니다.
+  // 중요: 총 속도가 아니라 '표면 쪽으로 가까워지는 속도(반경 방향)'만 봐야 합니다.
+  // 그래야 이륙 직후처럼 멀어지는 중일 땐 아무리 빨라도 경고가 안 뜹니다.
+  const relPos = { x: s.pos.x - ref.x, y: s.pos.y - ref.y };
+  const closingSpeed = -(relPos.x*s.vel.x + relPos.y*s.vel.y) / Math.max(el.r, 0.1);
+  const aNeeded = closingSpeed > 0 ? (closingSpeed*closingSpeed) / (2*Math.max(alt, 0.1)) : 0;
+  const mustBrake = !s.landed && !s.crashed && alt < ref.R*2 && aNeeded > CFG.MAX_THRUST*CFG.BRAKE_WARN;
+  $('brakeWarn').classList.toggle('show', mustBrake);
 
   const f = Math.round(s.fuel/CFG.FUEL*100);
   $('t-fuel').textContent = f + '%';
