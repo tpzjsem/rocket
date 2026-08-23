@@ -103,6 +103,7 @@
 
 <div class="layer">
   <dl id="tele">
+    <dt>근처</dt><dd id="t-ref">행성</dd>
     <dt>고도</dt><dd id="t-alt">0</dd>
     <dt>속도</dt><dd id="t-vel">0</dd>
     <dt>최고점</dt><dd id="t-apo">-</dd>
@@ -143,7 +144,7 @@ const CFG = {
   MAX_THRUST: 6.0,     // 최대 추력 (질량 1 기준) → 이륙 추중비 1.87
   TURN_RATE:  1.5,     // 손으로 도는 속도 (rad/s)
   ALIGN_RATE: 3.0,     // 자동정렬 도는 속도
-  FUEL:       40,      // 최대 추력 기준 연료 지속 시간(초)
+  FUEL:       65,      // 최대 추력 기준 연료 지속 시간(초). 달까지 갔다 착륙까지 하려면 넉넉하게.
   BOTTOM:     2.5,     // 로켓 중심에서 엔진 끝까지
   LAND_SPEED: 6,       // 이 속도 아래로 닿으면 착륙 성공
   UPRIGHT:    0.85,    // 착륙 시 요구되는 '똑바로' 정도
@@ -151,6 +152,11 @@ const CFG = {
   PRED_N:     260,     // 예측선 점 개수
   PRED_MAX:   40,      // 예측선을 그리는 최대 반경 (행성 반지름의 배수)
   CAM_TILT:   0.25,    // 2.5D 기울기(rad). 0이면 완전 정면
+
+  // ---- 달 ----
+  MOON_R:     90,       // 달 반지름 (행성보다 작게)
+  MOON_MU:    4500,     // 달 중력 세기. 표면 중력 = MOON_MU/MOON_R² ≈ 0.56 (행성의 1/6 정도 — 진짜 달처럼 약함, 착륙이 쉬워짐)
+  MOON_DIST:  1400,     // 행성 중심~달 중심 거리. 발사대 '바로 위' 방향에 둬서, 똑바로 위로만 날아가도 도착합니다.
 };
 
 /* ==================================================================
@@ -163,11 +169,31 @@ function newState(){
     vel:{ x:0, y:0 },
     angle: Math.PI/2,      // +X축 기준. π/2 = 하늘 방향
     fuel: CFG.FUEL,
-    landed: true, crashed: false, status: null, t: 0,
+    landed: true, landedOn: 'planet', crashed: false, status: null, t: 0,
   };
 }
 
 function wrapAngle(a){ return Math.atan2(Math.sin(a), Math.cos(a)); }
+
+// 이 게임에서 중력을 만드는 두 천체. 달은 지금은 고정되어 안 움직입니다
+// (발사대 바로 위쪽 방향이라, 똑바로 위로만 날아가도 만날 수 있어요).
+// 나중에 달도 궤도를 돌게 하고 싶으면 여기 x,y를 t의 함수로 바꾸면 됩니다.
+const BODIES = [
+  { name:'planet', x:0, y:0,             R:CFG.R,      MU:CFG.MU },
+  { name:'moon',   x:0, y:CFG.MOON_DIST, R:CFG.MOON_R, MU:CFG.MOON_MU },
+];
+
+// 지금 위치에서 중력을 가장 세게 받는 천체를 고릅니다.
+// 예측 궤도선/고도 표시는 전부 이 '기준 천체' 중심으로 계산합니다.
+function dominantBody(pos){
+  let best = BODIES[0], bestPull = -1;
+  for (const b of BODIES){
+    const dx = b.x - pos.x, dy = b.y - pos.y;
+    const pull = b.MU / (dx*dx + dy*dy);
+    if (pull > bestPull){ bestPull = pull; best = b; }
+  }
+  return best;
+}
 
 function step(s, dt, inp){
   if (s.crashed) return;
@@ -178,7 +204,12 @@ function step(s, dt, inp){
   if (inp.align){
     const sp = Math.hypot(s.vel.x, s.vel.y);
     let target;
-    if (sp < 1)                      target = Math.atan2(s.pos.y, s.pos.x);   // 멈춰있으면 '위'
+    if (sp < 1){
+      // 멈춰있으면 '위'를 봅니다 — 지금 가장 가까운 천체(행성/달) 기준으로.
+      // (예전엔 항상 행성 중심 기준이라, 달 위에서 느려지면 엉뚱한 방향을 봤습니다)
+      const b = dominantBody(s.pos);
+      target = Math.atan2(s.pos.y - b.y, s.pos.x - b.x);
+    }
     else if (inp.align === 'pro')    target = Math.atan2(s.vel.y, s.vel.x);
     else                             target = Math.atan2(-s.vel.y, -s.vel.x);
     const d = wrapAngle(target - s.angle);
@@ -186,11 +217,16 @@ function step(s, dt, inp){
   }
   s.angle = wrapAngle(s.angle + turn*dt);
 
-  // --- 2. 가속도 = 중력 + 추력 ---
-  const r2 = s.pos.x*s.pos.x + s.pos.y*s.pos.y;
-  const r  = Math.sqrt(r2);
-  const g  = -CFG.MU / (r2*r);              // a_grav = g * pos
-  let ax = s.pos.x*g, ay = s.pos.y*g;
+  // --- 2. 가속도 = (행성 중력 + 달 중력) + 추력 ---
+  // 두 천체가 각각 잡아당기는 만큼을 그냥 더합니다 — 진짜 중력이 하는 일 그대로입니다.
+  let ax = 0, ay = 0;
+  for (const b of BODIES){
+    const dx = b.x - s.pos.x, dy = b.y - s.pos.y;
+    const r2 = dx*dx + dy*dy;
+    const r  = Math.sqrt(r2);
+    const g  = b.MU / (r2*r);              // 로켓 → 천체 방향으로 당기는 세기
+    ax += dx*g;  ay += dy*g;
+  }
 
   let burning = false;
   if (s.fuel > 0 && inp.throttle > 0.01){
@@ -199,7 +235,7 @@ function step(s, dt, inp){
     ay += Math.sin(s.angle)*T;
     s.fuel = Math.max(0, s.fuel - inp.throttle*dt);
     burning = true;
-    s.landed = false;                        // 엔진 켜면 발사대에서 떨어짐
+    s.landed = false;                        // 엔진 켜면 발사대(또는 달 표면)에서 떨어짐
   }
   s.burning = burning;
 
@@ -208,21 +244,28 @@ function step(s, dt, inp){
   s.vel.x += ax*dt;  s.vel.y += ay*dt;
   s.pos.x += s.vel.x*dt;  s.pos.y += s.vel.y*dt;
 
-  // --- 4. 지면 ---
-  const nr = Math.hypot(s.pos.x, s.pos.y);
-  const ground = CFG.R + CFG.BOTTOM;
-  if (nr < ground){
-    const nx = s.pos.x/nr, ny = s.pos.y/nr;
-    s.pos.x = nx*ground;  s.pos.y = ny*ground;
-    const speed   = Math.hypot(s.vel.x, s.vel.y);
-    const upright = Math.cos(s.angle)*nx + Math.sin(s.angle)*ny;
-    s.vel.x = 0; s.vel.y = 0;
-    if (!s.landed){
-      if (speed < CFG.LAND_SPEED && upright > CFG.UPRIGHT){
-        s.landed = true;  s.status = ['착륙 성공','엔진을 켜면 다시 떠오릅니다'];
-      } else {
-        s.crashed = true; s.status = ['쿵! 부서졌어요','더 천천히, 더 똑바로 내려앉아 보세요'];
+  // --- 4. 지면 (행성이든 달이든 같은 방식으로 판정) ---
+  for (const b of BODIES){
+    const dx = s.pos.x - b.x, dy = s.pos.y - b.y;
+    const nr = Math.hypot(dx, dy);
+    const ground = b.R + CFG.BOTTOM;
+    if (nr < ground){
+      const nx = dx/nr, ny = dy/nr;
+      s.pos.x = b.x + nx*ground;  s.pos.y = b.y + ny*ground;
+      const speed   = Math.hypot(s.vel.x, s.vel.y);
+      const upright = Math.cos(s.angle)*nx + Math.sin(s.angle)*ny;
+      s.vel.x = 0; s.vel.y = 0;
+      if (!s.landed){
+        if (speed < CFG.LAND_SPEED && upright > CFG.UPRIGHT){
+          s.landed = true;  s.landedOn = b.name;
+          s.status = b.name === 'moon'
+            ? ['달 착륙 성공!','엔진을 켜면 다시 떠오릅니다']
+            : ['착륙 성공','엔진을 켜면 다시 떠오릅니다'];
+        } else {
+          s.crashed = true; s.status = ['쿵! 부서졌어요','더 천천히, 더 똑바로 내려앉아 보세요'];
+        }
       }
+      break;   // 한 번에 한 천체 표면에만 닿을 수 있습니다
     }
   }
 }
@@ -234,6 +277,16 @@ function orbitOf(pos, vel, mu){
   const r   = Math.hypot(pos.x, pos.y);
   const v2  = vel.x*vel.x + vel.y*vel.y;
   const h   = pos.x*vel.y - pos.y*vel.x;          // 각운동량(2D면 스칼라)
+
+  // 똑바로 위/아래로만 날면(h가 거의 0) 이심률 공식이 0/0으로 흔들려서
+  // 최고점이 0과 ∞ 사이를 오가며 튑니다. 이땐 에너지식으로 바로 구합니다 —
+  // "위로 던진 공이 어디까지 올라가는가"와 똑같은 계산이라 훨씬 안정적입니다.
+  if (Math.abs(h) < 1e-6){
+    const eps = v2/2 - mu/r;                      // 비에너지(specific orbital energy)
+    const apo = eps < 0 ? -mu/eps : Infinity;
+    return { r, e:1, p:0, h:0, omega:Math.atan2(pos.y,pos.x), nu:0, peri:0, apo };
+  }
+
   const rdv = pos.x*vel.x + pos.y*vel.y;
   const k   = v2 - mu/r;
   const ex  = (k*pos.x - rdv*vel.x)/mu;           // 이심률 벡터
@@ -247,7 +300,7 @@ function orbitOf(pos, vel, mu){
            apo:  e < 1 ? p/(1-e) : Infinity };
 }
 
-function predictPath(el, out){
+function predictPath(el, out, ref){
   const dir  = el.h >= 0 ? 1 : -1;
   const lim  = CFG.R * CFG.PRED_MAX;
   let n = 0, hitGround = false;
@@ -257,10 +310,10 @@ function predictPath(el, out){
     if (den < 0.02) break;                        // 쌍곡선 점근선
     const r = el.p/den;
     if (r > lim) break;
-    if (r < CFG.R){ hitGround = true; break; }    // 여기서 부딪힙니다
+    if (r < ref.R){ hitGround = true; break; }    // 여기서 부딪힙니다 (기준 천체 표면)
     const a = nu + el.omega;
-    out[n*3+0] = r*Math.cos(a);
-    out[n*3+1] = r*Math.sin(a);
+    out[n*3+0] = ref.x + r*Math.cos(a);
+    out[n*3+1] = ref.y + r*Math.sin(a);
     out[n*3+2] = 0;
     n++;
   }
@@ -321,6 +374,21 @@ for (let i=0;i<40;i++){
              new THREE.MeshStandardMaterial({ color:0x8b95a6, roughness:.7 }));
   pad.position.set(0, CFG.R, 0);
   scene.add(pad);
+}
+
+// --- 달 ---
+const moon = new THREE.Mesh(
+  new THREE.SphereGeometry(CFG.MOON_R, 48, 32),
+  new THREE.MeshStandardMaterial({ color:0x9aa2ae, roughness:1 })
+);
+moon.position.set(0, CFG.MOON_DIST, 0);
+scene.add(moon);
+// 달 착륙 목표 지점 표시 (행성 쪽을 향한 면 — 발사대에서 보이는 방향)
+{
+  const moonPad = new THREE.Mesh(new THREE.BoxGeometry(10,2,10),
+                 new THREE.MeshStandardMaterial({ color:0xffa432, roughness:.6 }));
+  moonPad.position.set(0, CFG.MOON_DIST - CFG.MOON_R, 0);
+  scene.add(moonPad);
 }
 
 // --- 로켓 ---
@@ -468,20 +536,22 @@ function draw(){
   flame.scale.set(0.7+th*0.5, th*(0.85+Math.random()*0.3), 0.7+th*0.5);
   rocket.visible = !s.crashed;
 
-  // 궤도
-  const el = orbitOf(s.pos, s.vel, CFG.MU);
-  const { count, hitGround } = predictPath(el, predBuf);
+  // 궤도 — 지금 더 세게 당기는 천체(행성 또는 달)를 기준으로 계산합니다
+  const ref = dominantBody(s.pos);
+  const relPos = { x: s.pos.x - ref.x, y: s.pos.y - ref.y };
+  const el = orbitOf(relPos, s.vel, ref.MU);
+  const { count, hitGround } = predictPath(el, predBuf, ref);
   predGeo.attributes.position.needsUpdate = true;
   predGeo.setDrawRange(0, count);
-  const danger = hitGround || el.peri < CFG.R;
+  const danger = hitGround || el.peri < ref.R;
   predLine.material.color.setHex(danger ? 0xff4d5e : 0x3ce089);
   predLine.visible = !s.landed && !s.crashed && count > 2;
 
-  // 최고/최저점 마커
+  // 최고/최저점 마커 (기준 천체 중심 기준)
   if (predLine.visible && el.e < 1){
     const wa = el.omega;
-    markBuf[0]=Math.cos(wa)*el.peri;      markBuf[1]=Math.sin(wa)*el.peri;      markBuf[2]=0;
-    markBuf[3]=-Math.cos(wa)*el.apo;      markBuf[4]=-Math.sin(wa)*el.apo;      markBuf[5]=0;
+    markBuf[0]=ref.x+Math.cos(wa)*el.peri;      markBuf[1]=ref.y+Math.sin(wa)*el.peri;      markBuf[2]=0;
+    markBuf[3]=ref.x-Math.cos(wa)*el.apo;      markBuf[4]=ref.y-Math.sin(wa)*el.apo;      markBuf[5]=0;
     markGeo.attributes.position.needsUpdate = true;
     marks.visible = true;
   } else marks.visible = false;
@@ -490,11 +560,13 @@ function draw(){
   let target, want;
   if (mapView){
     target = new THREE.Vector3(0,0,0);
-    const far = (el.e < 1 && isFinite(el.apo)) ? el.apo : Math.max(el.r, CFG.R*3);
-    want = Math.min(far*1.5 + CFG.R, CFG.R*CFG.PRED_MAX);
+    // 지도 화면에서는 항상 행성과 달이 같이 보이게 잡습니다
+    const farFromPlanet = Math.hypot(s.pos.x, s.pos.y);
+    const far = Math.max(farFromPlanet, CFG.MOON_DIST, CFG.R*3);
+    want = Math.min(far*1.35 + CFG.R, CFG.R*CFG.PRED_MAX);
   } else {
     target = new THREE.Vector3(s.pos.x, s.pos.y, 0);
-    const alt = Math.max(0, el.r - CFG.R);
+    const alt = Math.max(0, el.r - ref.R);
     want = 60 + alt*0.9;                              // 고도에 따라 자동 줌아웃
   }
   camDist += (want - camDist) * 0.08;                 // 부드럽게 따라감
@@ -502,18 +574,19 @@ function draw(){
   camera.position.set(target.x, target.y - Math.sin(t)*camDist, Math.cos(t)*camDist);
   camera.lookAt(target);
 
-  hud(s, el, danger);
+  hud(s, el, danger, ref);
   renderer.render(scene, camera);
 }
 
 /* ---------------- HUD ---------------- */
 const fmt = v => !isFinite(v) ? '∞' : Math.round(v).toLocaleString('ko');
-function hud(s, el, danger){
-  $('t-alt').textContent = fmt(el.r - CFG.R);
+function hud(s, el, danger, ref){
+  $('t-ref').textContent = ref.name === 'moon' ? '달' : '행성';
+  $('t-alt').textContent = fmt(el.r - ref.R);
   $('t-vel').textContent = fmt(Math.hypot(s.vel.x, s.vel.y));
-  $('t-apo').textContent = el.e < 1 ? fmt(el.apo - CFG.R) : '탈출';
+  $('t-apo').textContent = el.e < 1 ? fmt(el.apo - ref.R) : '탈출';
   const per = $('t-per');
-  per.textContent = fmt(el.peri - CFG.R);
+  per.textContent = fmt(el.peri - ref.R);
   per.className = danger ? 'bad' : 'good';
   $('t-apo').className = danger ? '' : 'good';
 
